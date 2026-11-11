@@ -1,0 +1,4 @@
+firmware/.pio/
+firmware/src/*/config.h
+server/nahravky/
+hlasovy-asistent-chatka.md
