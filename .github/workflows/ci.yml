@@ -37,6 +37,7 @@ jobs:
 
       - name: Host unit tests (ASan + UBSan)
         run: |
+          . "$IDF_PATH/export.sh" # puts the IDF-provided cmake and ninja on PATH
           cmake -S test/host -B build-host -G Ninja
           cmake --build build-host
           ctest --test-dir build-host --output-on-failure
