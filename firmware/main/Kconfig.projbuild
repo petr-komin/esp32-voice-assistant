@@ -1,0 +1,97 @@
+menu "Voice terminal"
+
+    menu "Pin assignment"
+        config VT_SPEAKER_BCLK_GPIO
+            int "Amplifier BCLK"
+            range 0 33
+            default 27
+        config VT_SPEAKER_WS_GPIO
+            int "Amplifier LRC (word select)"
+            range 0 33
+            default 26
+        config VT_SPEAKER_DATA_GPIO
+            int "Amplifier DIN"
+            range 0 33
+            default 25
+
+        config VT_MIC_BCLK_GPIO
+            int "Microphone SCK"
+            range 0 33
+            default 33
+        config VT_MIC_WS_GPIO
+            int "Microphone WS"
+            range 0 33
+            default 32
+        config VT_MIC_DATA_GPIO
+            int "Microphone SD"
+            range 0 39
+            default 35
+            help
+                GPIO 34-39 are input-only on the ESP32, which is fine for microphone data.
+
+        config VT_LED_GREEN_GPIO
+            int "Green LED (ready / recording)"
+            range 0 33
+            default 21
+        config VT_LED_YELLOW_GPIO
+            int "Yellow LED (busy / playing)"
+            range 0 33
+            default 18
+        config VT_LED_RED_GPIO
+            int "Red LED (error / offline)"
+            range 0 33
+            default 2
+            help
+                GPIO 2 is a strapping pin; an LED to GND keeps it low, which is
+                what download mode requires.
+    endmenu
+
+    menu "Microphone"
+        config VT_MIC_RIGHT_SLOT
+            bool "Microphone on the right I2S slot (L/R pin high)"
+            default n
+        config VT_MIC_GAIN_SHIFT
+            int "Gain shift (16 = unity, each step down adds 6 dB)"
+            range 8 16
+            default 14
+    endmenu
+
+    menu "Voice activity detection"
+        config VT_VAD_START_FACTOR_X10
+            int "Start threshold, x10 above noise floor"
+            range 11 100
+            default 30
+        config VT_VAD_STOP_FACTOR_X10
+            int "Stop threshold, x10 above noise floor"
+            range 10 100
+            default 20
+        config VT_VAD_MIN_LEVEL
+            int "Minimum start level (RMS, int16 units)"
+            range 50 10000
+            default 500
+        config VT_VAD_START_MS
+            int "Speech must last this long to start (ms)"
+            range 20 500
+            default 60
+        config VT_VAD_HANG_MS
+            int "Silence that ends speech (ms)"
+            range 200 3000
+            default 800
+        config VT_VAD_PREROLL_MS
+            int "Audio kept from before speech starts (ms)"
+            range 0 1000
+            default 200
+        config VT_VAD_MIN_SPEECH_MS
+            int "Shorter sounds are ignored (ms)"
+            range 0 2000
+            default 200
+    endmenu
+
+    config VT_ECHO_MAX_RECORD_MS
+        int "Local echo: maximum recording length (ms)"
+        range 500 5000
+        default 3000
+        help
+            The recording is held in internal RAM (32 kB per second).
+
+endmenu

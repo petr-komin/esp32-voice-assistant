@@ -1,105 +1,116 @@
-# Mluvící krabička
+# ESP32 voice assistant
 
-Hlasový terminál s ESP32: mikrofon, reproduktor a WebSocket na server, který
-audio zpracuje (STT → LLM → TTS) a hlasem odpoví. Bez wake wordu a bez displeje,
-první aplikací bude ovládání topení. Vzniká postupně jako seriál, každý krok je
-samostatné prostředí ve firmwaru.
+[![CI](https://github.com/petr-komin/esp32-voice-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/petr-komin/esp32-voice-assistant/actions/workflows/ci.yml)
 
-- `firmware/` – PlatformIO + Arduino, zatím klasické ESP32 (esp32dev),
-- `server/` – služba v Go, zatím jen echo.
+*Česky: [README.cs.md](README.cs.md)*
 
-## Zapojení (klasické ESP32)
+A battery-powered voice terminal: an ESP32 with a MEMS microphone, a speaker and
+three status LEDs streams speech over a WebSocket to a server, which transcribes
+it, lets an LLM act on it (the first application is heating control for a
+cottage) and answers with synthesised speech. No wake word and no display: the
+device wakes on a shake and starts listening.
 
-| ESP32   | MAX98357A | INMP441 |
-|---------|-----------|---------|
-| GPIO 27 | BCLK      |         |
-| GPIO 26 | LRC       |         |
-| GPIO 25 | DIN       |         |
-| GPIO 33 |           | SCK     |
-| GPIO 32 |           | WS      |
-| GPIO 35 |           | SD      |
-| 3V3     |           | VDD     |
-| GND     | GND       | GND, L/R |
+The project is built step by step; each step is a working, tested system.
 
-Zesilovač je zapojený stejně jako v [esp32-i2s-demo](https://github.com/petr-komin/esp32-i2s-demo).
-Tlačítko je zatím BOOT (GPIO 0) přímo na desce. Piny jsou v `firmware/include/piny.h`.
+| Step | Status |
+|---|---|
+| 1. Hardware bring-up, voice activity detection, local echo | **done** (ESP-IDF) |
+| 2. Echo through the server over WebSocket | server done, firmware port in progress |
+| 3. TLS (`wss://`) with certificate verification, nginx | planned |
+| 4. Speech-to-text, LLM with tools, text-to-speech | planned |
+| 5. Deep sleep, wake on shake (LSM6DS3), battery | planned |
+| 6. Signed OTA updates, secure boot, flash encryption | planned |
 
-## Krok 1: místní echo
+## Architecture
 
-Nahraje 3 s z mikrofonu a přehraje je, pořád dokola. Ověří mikrofon i zesilovač bez sítě.
-
-```sh
-cd firmware
-pio run -e 01_mistni_echo -t upload && pio device monitor
+```
+┌──────────── ESP32 ─────────────┐        ┌────────── server (Docker) ──────────┐
+│ INMP441 ─I2S1─▶ dsp ─▶ vad ─┐  │  wss   │  nginx (TLS) ─▶ voice service (Go)  │
+│                             ├─▶├───────▶│      STT ─▶ LLM + tools ─▶ TTS      │
+│ MAX98357A ◀─I2S0─ playback ◀┘  │        │                 │                   │
+│ LEDs ◀─ status_led             │        │        heating schedule, sensors    │
+└────────────────────────────────┘        └─────────────────────────────────────┘
 ```
 
-V konzoli se vypisuje úroveň nahrávky. Když je špička 0, prohoď v `include/audio.h`
-`MIC_CHANNEL` na `I2S_CHANNEL_FMT_ONLY_RIGHT`. Hlasitost mikrofonu se ladí
-konstantou `MIC_SHIFT`.
+* **firmware/** – ESP-IDF 6.0 (C11), FreeRTOS tasks, one component per concern:
+  * `dsp` – microphone sample conversion, DC blocking, levels (pure C, host-tested)
+  * `vad` – energy-based voice activity detection with adaptive noise floor and
+    pre-roll buffer (pure C, host-tested)
+  * `audio` – I2S capture and playback on the `i2s_std` driver
+  * `status_led` – device state on three LEDs, timer-driven blinking
+  * `main` – application; pins and tuning in `menuconfig` (*Voice terminal* menu)
+* **server/** – Go service, WebSocket protocol, static binary on `scratch`.
+* **docs/protocol.md** – device ↔ server protocol.
+* **SECURITY.md** – threat model and vulnerability reporting.
 
-## Krok 2: echo přes server
+## Engineering practices
 
-Server v Dockeru (pro zkoušení v místní síti port otevřený do LAN; na ostrém serveru
-`-p 127.0.0.1:8090:8090` a před ním nginx):
+* Reproducible builds: firmware is built in the pinned `espressif/idf:v6.0.3`
+  container, the same locally and in CI.
+* Warnings as errors (`-Wall -Wextra -Wshadow -Wdouble-promotion …`), stack
+  protector, FreeRTOS stack canaries, task watchdog, brown-out detection.
+* Hardware-independent logic is unit-tested on the host with Unity under
+  AddressSanitizer and UBSan.
+* `clang-format` and `cppcheck` for the firmware; `gofmt`, `go vet`, race
+  detector and `govulncheck` for the server.
+* No dynamic allocation in the audio path; buffers are sized at start-up.
+* CI on every push; GitHub Actions pinned to commit SHAs, Dependabot updates.
+
+## Hardware (ESP32-WROOM-32 dev board)
+
+| ESP32 | MAX98357A | INMP441 | LEDs (via 220–330 Ω to GND) |
+|---|---|---|---|
+| GPIO 27 | BCLK | | |
+| GPIO 26 | LRC | | |
+| GPIO 25 | DIN | | |
+| GPIO 33 | | SCK | |
+| GPIO 32 | | WS | |
+| GPIO 35 | | SD | |
+| GPIO 21 | | | green – listening (on), recording (blinking) |
+| GPIO 18 | | | yellow – busy (on), playing (blinking) |
+| GPIO 2 | | | red – error (on), offline (blinking) |
+| 3V3 | VIN | VDD | |
+| GND | GND | GND, L/R | cathodes |
+
+All pins can be changed in `idf.py menuconfig` → *Voice terminal* → *Pin assignment*.
+
+## Building the firmware
+
+Requires Docker only; `scripts/idf.sh` runs `idf.py` in the ESP-IDF container
+and passes serial ports through.
+
+```sh
+scripts/idf.sh set-target esp32        # once
+scripts/idf.sh build
+scripts/idf.sh -p /dev/ttyUSB0 flash
+scripts/host-tests.sh                  # unit tests on the PC
+```
+
+Keep `scripts/monitor.py` running in a second terminal: it releases the serial
+port while `scripts/idf.sh` flashes, then reconnects and resets the board so the
+full boot log is shown. Output is also appended to `logs/serial.log`.
+
+Speak near the microphone: the green LED blinks while recording, then the
+recording is played back while the yellow LED blinks. Voice activity detection
+is tuned in `menuconfig` → *Voice terminal* → *Voice activity detection*.
+
+## Running the server
 
 ```sh
 cd server
-docker build -t mluvici-krabicka-voice .
-mkdir -p nahravky
-docker run --rm -p 8090:8090 --user $(id -u):$(id -g) \
-  -e VOICE_TOKEN=zmen-me -e RECORD_DIR=/nahravky -v "$PWD/nahravky:/nahravky" \
-  mluvici-krabicka-voice
+docker build -t voice-server .
+docker run --rm -p 127.0.0.1:8090:8090 -e VOICE_TOKEN="$(openssl rand -hex 16)" voice-server
 ```
 
-`RECORD_DIR` je nepovinný: každá nahrávka se uloží jako WAV, takže jde poslechnout,
-co mikrofon opravdu nahrál.
+| Variable | Meaning |
+|---|---|
+| `VOICE_TOKEN` | shared device token, at least 16 characters (required) |
+| `LISTEN_ADDR` | default `:8090` |
+| `RECORD_DIR` | optional; every utterance is saved there as WAV for debugging |
 
-Firmware:
+In production the container port is published on localhost only and nginx
+terminates TLS in front of it (`/voice` location with WebSocket upgrade).
 
-```sh
-cd firmware
-cp src/02_echo_server/config.example.h src/02_echo_server/config.h   # vyplnit WiFi, IP serveru, token
-pio run -e 02_echo_server -t upload && pio device monitor
-```
-
-Podrž BOOT a mluv, po puštění se nahrávka vrátí ze serveru a přehraje.
-
-Testy serveru (bez nainstalovaného Go):
-
-```sh
-docker run --rm -v "$PWD/server":/src -w /src golang:1.23-alpine go test -v ./...
-```
-
-## Protokol krabička ↔ server
-
-WebSocket, textové rámce nesou řídicí JSON, binární rámce audio
-(PCM, 16 kHz, 16 bit, mono, po 100 ms).
-
-```
-krabička → server
-  {"type":"hello","device":"chatka-box","token":"…","fw":"0.1"}
-  {"type":"start","format":"pcm16","rate":16000}
-  [binární rámce audia]
-  {"type":"end"}
-
-server → krabička
-  {"type":"ack"}            ← hned po "start": server žije a přijímá
-  {"type":"thinking"}       ← po "end": běží zpracování
-  {"type":"audio_start","format":"pcm16","rate":16000}
-  [binární rámce odpovědi]  ← přehrávají se hned, nečeká se na celou odpověď
-  {"type":"done","action":{...}}
-  {"type":"error","code":"auth|format|protocol|too_long|..."}
-```
-
-Časové limity na krabičce: `ack` do 3 s od `start`, `audio_start` do 15 s od `end`.
-Aplikační `ack` je tu proto, že potvrzení TCP neříká, že server data opravdu zpracoval.
-
-## Co zatím chybí
-
-- `wss://` s ověřením certifikátu a nginx (teď obyčejný `ws://` v místní síti),
-- LED, offline hlášky, detekce ticha, deep sleep,
-- přechod na ESP32-S3.
-
-## Licence
+## License
 
 [GPL-3.0](LICENSE)

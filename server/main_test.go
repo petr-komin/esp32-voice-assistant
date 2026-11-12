@@ -16,7 +16,7 @@ import (
 
 func dial(t *testing.T) (context.Context, *websocket.Conn) {
 	t.Helper()
-	s := &server{token: "tajne", log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	s := &server{token: "0123456789abcdef", log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	ts := httptest.NewServer(s.mux())
 	t.Cleanup(ts.Close)
 
@@ -41,20 +41,20 @@ func expect(t *testing.T, ctx context.Context, c *websocket.Conn, want string) m
 	t.Helper()
 	typ, data, err := c.Read(ctx)
 	if err != nil {
-		t.Fatalf("čekal jsem %q: %v", want, err)
+		t.Fatalf("expected %q: %v", want, err)
 	}
 	var msg message
 	if typ != websocket.MessageText || json.Unmarshal(data, &msg) != nil || msg.Type != want {
-		t.Fatalf("čekal jsem %q, přišlo %s", want, data)
+		t.Fatalf("expected %q, got %s", want, data)
 	}
 	return msg
 }
 
 func TestEcho(t *testing.T) {
 	ctx, c := dial(t)
-	send(t, ctx, c, message{Type: "hello", Device: "test", Token: "tajne", FW: "0.1"})
+	send(t, ctx, c, message{Type: "hello", Device: "test", Token: "0123456789abcdef", FW: "0.1"})
 
-	// Dvě kola za sebou, ať je vidět, že se buffer mezi nimi vyprázdní.
+	// Two rounds in a row: the buffer must be emptied between them.
 	for round := 0; round < 2; round++ {
 		send(t, ctx, c, message{Type: "start", Format: "pcm16", Rate: 16000})
 		expect(t, ctx, c, "ack")
@@ -83,38 +83,38 @@ func TestEcho(t *testing.T) {
 				var msg message
 				json.Unmarshal(data, &msg)
 				if msg.Type != "done" {
-					t.Fatalf("čekal jsem done, přišlo %s", data)
+					t.Fatalf("expected done, got %s", data)
 				}
 				break
 			}
 			got = append(got, data...)
 		}
 		if !bytes.Equal(got, audio) {
-			t.Fatalf("kolo %d: vrácené audio se liší (%d B místo %d B)", round, len(got), len(audio))
+			t.Fatalf("round %d: echoed audio differs (%d B instead of %d B)", round, len(got), len(audio))
 		}
 	}
 }
 
 func TestBadToken(t *testing.T) {
 	ctx, c := dial(t)
-	send(t, ctx, c, message{Type: "hello", Device: "test", Token: "spatne"})
+	send(t, ctx, c, message{Type: "hello", Device: "test", Token: "wrong-token-wrong"})
 	if msg := expect(t, ctx, c, "error"); msg.Code != "auth" {
-		t.Fatalf("čekal jsem kód auth, přišlo %q", msg.Code)
+		t.Fatalf("expected code auth, got %q", msg.Code)
 	}
 }
 
 func TestWrongFormat(t *testing.T) {
 	ctx, c := dial(t)
-	send(t, ctx, c, message{Type: "hello", Device: "test", Token: "tajne"})
+	send(t, ctx, c, message{Type: "hello", Device: "test", Token: "0123456789abcdef"})
 	send(t, ctx, c, message{Type: "start", Format: "pcm16", Rate: 44100})
 	if msg := expect(t, ctx, c, "error"); msg.Code != "format" {
-		t.Fatalf("čekal jsem kód format, přišlo %q", msg.Code)
+		t.Fatalf("expected code format, got %q", msg.Code)
 	}
 }
 
 func TestWAVHeader(t *testing.T) {
 	w := wav(make([]byte, 320))
 	if len(w) != 364 || string(w[0:4]) != "RIFF" || string(w[36:40]) != "data" {
-		t.Fatalf("špatná hlavička: % x", w[:44])
+		t.Fatalf("bad header: % x", w[:44])
 	}
 }

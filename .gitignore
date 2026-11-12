@@ -1,4 +1,14 @@
-firmware/.pio/
-firmware/src/*/config.h
-server/nahravky/
+# Firmware (ESP-IDF)
+firmware/build/
+firmware/build-host/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/managed_components/
+firmware/dependencies.lock.local
+
+# Server
+server/recordings/
+
+# Private notes
 hlasovy-asistent-chatka.md
+logs/

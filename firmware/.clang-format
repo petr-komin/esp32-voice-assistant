@@ -1,0 +1,12 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AlignConsecutiveMacros: Consecutive
+IndentPPDirectives: None
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve

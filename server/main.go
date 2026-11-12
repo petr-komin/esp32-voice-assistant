@@ -1,5 +1,7 @@
-// Hlasová služba mluvící krabičky. Zatím jen echo: co krabička pošle, to vrátí.
-// Protokol je popsaný v README.md v kořeni repozitáře.
+// Command server is the voice service for the ESP32 voice terminal.
+//
+// For now it is an echo service: the audio a device sends is returned unchanged.
+// The device protocol is described in docs/protocol.md.
 package main
 
 import (
@@ -12,21 +14,26 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
 )
 
 const (
-	sampleRate    = 16000
-	frameBytes    = sampleRate / 10 * 2 // 100 ms audia, 16 bit mono
-	maxAudioBytes = 30 * sampleRate * 2 // 30 s
-	helloTimeout  = 5 * time.Second
-	idleTimeout   = 120 * time.Second // stejně jako proxy_read_timeout v nginx
+	sampleRate     = 16000
+	frameBytes     = sampleRate / 10 * 2 // 100 ms of 16-bit mono audio
+	maxAudioBytes  = 30 * sampleRate * 2 // 30 s per utterance
+	maxMessageSize = 64 * 1024
+	helloTimeout   = 5 * time.Second
+	idleTimeout    = 120 * time.Second // matches proxy_read_timeout in nginx
+	authFailDelay  = time.Second       // slows down token guessing
+	shutdownGrace  = 10 * time.Second
 )
 
-// message je řídicí zpráva v textovém rámci. Každý typ používá jen některá pole.
+// message is a control message carried in a text frame. Each type uses a subset of the fields.
 type message struct {
 	Type   string         `json:"type"`
 	Device string         `json:"device,omitempty"`
@@ -40,11 +47,11 @@ type message struct {
 
 type server struct {
 	token     string
-	recordDir string // když není prázdný, ukládá se sem každá nahrávka jako WAV
+	recordDir string // when set, every utterance is saved here as WAV
 	log       *slog.Logger
 }
 
-// protocolError se pošle krabičce jako {"type":"error"} a spojení se zavře.
+// protocolError is reported to the device as {"type":"error"} before the connection is closed.
 type protocolError struct {
 	code   string
 	detail string
@@ -58,7 +65,7 @@ func (s *server) handleVoice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer c.CloseNow()
-	c.SetReadLimit(64 * 1024)
+	c.SetReadLimit(maxMessageSize)
 
 	remote := r.Header.Get("X-Real-IP")
 	if remote == "" {
@@ -71,14 +78,17 @@ func (s *server) handleVoice(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case err == nil, websocket.CloseStatus(err) == websocket.StatusNormalClosure,
 		websocket.CloseStatus(err) == websocket.StatusGoingAway:
-		log.Info("spojení ukončeno")
+		log.Info("connection closed")
 		c.Close(websocket.StatusNormalClosure, "")
 	case errors.As(err, &pe):
-		log.Warn("chyba protokolu", "code", pe.code, "detail", pe.detail)
-		writeJSON(r.Context(), c, message{Type: "error", Code: pe.code})
+		log.Warn("protocol error", "code", pe.code, "detail", pe.detail)
+		if pe.code == "auth" {
+			time.Sleep(authFailDelay)
+		}
+		_ = writeJSON(r.Context(), c, message{Type: "error", Code: pe.code})
 		c.Close(websocket.StatusPolicyViolation, pe.code)
 	default:
-		log.Warn("spojení spadlo", "err", err)
+		log.Warn("connection lost", "err", err)
 	}
 }
 
@@ -88,10 +98,10 @@ func (s *server) session(ctx context.Context, c *websocket.Conn, log *slog.Logge
 		return err
 	}
 	if subtle.ConstantTimeCompare([]byte(hello.Token), []byte(s.token)) != 1 {
-		return &protocolError{"auth", "špatný token od " + hello.Device}
+		return &protocolError{"auth", "invalid token from device " + hello.Device}
 	}
 	log = log.With("device", hello.Device, "fw", hello.FW)
-	log.Info("krabička připojena")
+	log.Info("device connected")
 
 	var audio []byte
 	recording := false
@@ -107,10 +117,10 @@ func (s *server) session(ctx context.Context, c *websocket.Conn, log *slog.Logge
 
 		if typ == websocket.MessageBinary {
 			if !recording {
-				return &protocolError{"protocol", "audio mimo start/end"}
+				return &protocolError{"protocol", "audio outside start/end"}
 			}
 			if len(audio)+len(data) > maxAudioBytes {
-				return &protocolError{"too_long", "nahrávka delší než 30 s"}
+				return &protocolError{"too_long", "utterance longer than 30 s"}
 			}
 			audio = append(audio, data...)
 			continue
@@ -118,12 +128,12 @@ func (s *server) session(ctx context.Context, c *websocket.Conn, log *slog.Logge
 
 		var msg message
 		if err := json.Unmarshal(data, &msg); err != nil {
-			return &protocolError{"protocol", "nečitelný JSON"}
+			return &protocolError{"protocol", "malformed JSON"}
 		}
 		switch msg.Type {
 		case "start":
 			if msg.Format != "pcm16" || msg.Rate != sampleRate {
-				return &protocolError{"format", fmt.Sprintf("%s/%d", msg.Format, msg.Rate)}
+				return &protocolError{"format", fmt.Sprintf("unsupported %s/%d", msg.Format, msg.Rate)}
 			}
 			audio = audio[:0]
 			recording = true
@@ -133,10 +143,10 @@ func (s *server) session(ctx context.Context, c *websocket.Conn, log *slog.Logge
 			}
 		case "end":
 			if !recording {
-				return &protocolError{"protocol", "end bez start"}
+				return &protocolError{"protocol", "end without start"}
 			}
 			recording = false
-			log.Info("nahrávka přijata",
+			log.Info("utterance received",
 				"bytes", len(audio),
 				"seconds", float64(len(audio))/2/sampleRate,
 				"took", time.Since(startedAt).Round(time.Millisecond))
@@ -148,7 +158,7 @@ func (s *server) session(ctx context.Context, c *websocket.Conn, log *slog.Logge
 				return err
 			}
 		default:
-			return &protocolError{"protocol", "neznámý typ " + msg.Type}
+			return &protocolError{"protocol", "unknown message type " + msg.Type}
 		}
 	}
 }
@@ -162,12 +172,12 @@ func readHello(ctx context.Context, c *websocket.Conn) (message, error) {
 	}
 	var msg message
 	if typ != websocket.MessageText || json.Unmarshal(data, &msg) != nil || msg.Type != "hello" {
-		return message{}, &protocolError{"protocol", "první zpráva musí být hello"}
+		return message{}, &protocolError{"protocol", "first message must be hello"}
 	}
 	return msg, nil
 }
 
-// respond pošle odpověď. Zatím je to přijaté audio beze změny.
+// respond sends the reply. For now it is the received audio, unchanged.
 func (s *server) respond(ctx context.Context, c *websocket.Conn, audio []byte) error {
 	if err := writeJSON(ctx, c, message{Type: "audio_start", Format: "pcm16", Rate: sampleRate}); err != nil {
 		return err
@@ -193,28 +203,29 @@ func (s *server) save(audio []byte, device string, log *slog.Logger) {
 	if s.recordDir == "" {
 		return
 	}
+	// filepath.Base keeps a hostile device name from escaping recordDir.
 	name := filepath.Join(s.recordDir,
 		fmt.Sprintf("%s_%s.wav", time.Now().Format("2006-01-02_15-04-05"), filepath.Base(device)))
-	if err := os.WriteFile(name, wav(audio), 0o644); err != nil {
-		log.Warn("nahrávku nejde uložit", "err", err)
+	if err := os.WriteFile(name, wav(audio), 0o640); err != nil {
+		log.Warn("cannot save recording", "err", err)
 		return
 	}
-	log.Info("nahrávka uložena", "file", name)
+	log.Info("recording saved", "file", name)
 }
 
-// wav přidá k 16bitovému mono PCM hlavičku, aby šlo nahrávku pustit v přehrávači.
+// wav wraps 16-bit mono PCM in a WAV header so it can be played in any player.
 func wav(pcm []byte) []byte {
 	h := make([]byte, 44, 44+len(pcm))
 	copy(h[0:], "RIFF")
 	binary.LittleEndian.PutUint32(h[4:], uint32(36+len(pcm)))
 	copy(h[8:], "WAVEfmt ")
-	binary.LittleEndian.PutUint32(h[16:], 16) // délka bloku fmt
+	binary.LittleEndian.PutUint32(h[16:], 16) // fmt chunk size
 	binary.LittleEndian.PutUint16(h[20:], 1)  // PCM
 	binary.LittleEndian.PutUint16(h[22:], 1)  // mono
 	binary.LittleEndian.PutUint32(h[24:], sampleRate)
-	binary.LittleEndian.PutUint32(h[28:], sampleRate*2) // bajtů za sekundu
-	binary.LittleEndian.PutUint16(h[32:], 2)            // bajtů na vzorek
-	binary.LittleEndian.PutUint16(h[34:], 16)           // bitů na vzorek
+	binary.LittleEndian.PutUint32(h[28:], sampleRate*2) // byte rate
+	binary.LittleEndian.PutUint16(h[32:], 2)            // block align
+	binary.LittleEndian.PutUint16(h[34:], 16)           // bits per sample
 	copy(h[36:], "data")
 	binary.LittleEndian.PutUint32(h[40:], uint32(len(pcm)))
 	return append(h, pcm...)
@@ -222,23 +233,23 @@ func wav(pcm []byte) []byte {
 
 func (s *server) mux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/voice", s.handleVoice)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok\n"))
+	mux.HandleFunc("GET /voice", s.handleVoice)
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok\n"))
 	})
 	return mux
 }
 
 func main() {
-	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	s := &server{
 		token:     os.Getenv("VOICE_TOKEN"),
 		recordDir: os.Getenv("RECORD_DIR"),
 		log:       log,
 	}
-	if s.token == "" {
-		log.Error("chybí proměnná VOICE_TOKEN")
+	if len(s.token) < 16 {
+		log.Error("VOICE_TOKEN must be set and at least 16 characters long")
 		os.Exit(1)
 	}
 	addr := os.Getenv("LISTEN_ADDR")
@@ -246,9 +257,27 @@ func main() {
 		addr = ":8090"
 	}
 
-	log.Info("poslouchám", "addr", addr, "record_dir", s.recordDir)
-	if err := http.ListenAndServe(addr, s.mux()); err != nil {
-		log.Error("server skončil", "err", err)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.mux(),
+		ReadHeaderTimeout: 5 * time.Second,
+		MaxHeaderBytes:    16 * 1024,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-ctx.Done()
+		log.Info("shutting down")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	log.Info("listening", "addr", addr, "record_dir", s.recordDir)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Error("server failed", "err", err)
 		os.Exit(1)
 	}
 }
